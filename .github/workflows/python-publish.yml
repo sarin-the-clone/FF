@@ -31,4 +31,8 @@ jobs:
         python setup.py sdist bdist_wheel
         twine upload dist/*
 
-        run: python covid19_daily_cases.py
+        run: python gogo.py
+
+
+
+
