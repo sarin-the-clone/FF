@@ -31,8 +31,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt      
     - name: Go Go Go
-      run: |
-        run: python gogo.py
+      run: python gogo.py
 
 
 
