@@ -22,6 +22,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
+
+      - name: Build binary wheel
+        run: pip wheel . -w dist --no-deps
         
       - name: Set up Python
         uses: actions/setup-python@v2
