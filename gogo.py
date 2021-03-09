@@ -1,7 +1,7 @@
 import pandas as pd
 import lol
 
-disp == True
+disp = True
 
 # load temperature timeseries from 'dftempall.pickle'
 # sourceID = weather station name
