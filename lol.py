@@ -1,7 +1,15 @@
 
+from datetime import datetime, date, timedelta
+import pandas as pd
+import numpy as np
+
+# base temperature : 5 celsius for timothy
+tbase = 5
+
 def sos(dft):
-    # dft = timeseries
-    tbase = 5
+    # returns start of the season
+    # dft = pandas timeseries
+
     mv_avg = [1,1,1]
     out = pd.DataFrame(columns=dft.columns)
     dft5C = (dft >= tbase) *1
@@ -18,8 +26,9 @@ def sos(dft):
     return out
 
 def gdd(ts):
-    #ts = timeseries
-    tbase = 5
+    # returns accumulated growth degree days
+    # ts = pandas timeseries
+
     out = pad_ts(ts).copy()
     out[out<tbase]=0
     for k in out.columns:
