@@ -2,3 +2,6 @@ numpy
 pandas
 datetime
 matplotlib
+tensorflow
+keras
+math
