@@ -11,6 +11,9 @@ from sklearn.preprocessing import StandardScaler
 
 import fbprophet
 from fbprophet import Prophet
+import itertools
+from fbprophet.diagnostics import cross_validation
+from fbprophet.diagnostics import performance_metrics
 
 import tensorflow as tf
 from tensorflow import keras
@@ -23,7 +26,6 @@ from math import sqrt
 disp = False
 # base temperature : 5 celsius for timothy
 tbase = 5
-
 
 # %%
 def sos(dft):
@@ -117,6 +119,15 @@ def split_sequence(sequence, n_steps_in, n_steps_out):
         y.append(seq_y)
     return np.array(X), np.array(y)
 
+def stan_init(m):
+    res = {}
+    for pname in ['k', 'm', 'sigma_obs']:
+        res[pname] = m.params[pname][0][0]
+    for pname in ['delta', 'beta']:
+        res[pname] = m.params[pname][0]
+    return res
+
+# %%
 class weather_station:
     def __init__(self, df_t, dd_historic, dd_horizon, year_train, model_type):
         # df_t is a pd.Series
