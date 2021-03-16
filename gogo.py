@@ -46,15 +46,15 @@ src = lol.weather_station(df_t, dhist, dhoriz, n_years_2train, 'lstm')
 
 ##### plot input temperatures and forecast #####
 start = src.data.index[src.year_train*365+src.dd_historic+src.dd_horizon] #first day after validation data
-end =  src.data.index[-src.dd_horizon-1]
+end =  df_t.index[-src.dd_horizon-1]
 for today in pd.date_range(start,end):
     plt.cla()
     ind_curr = pd.date_range(today-timedelta(dhist-1),today)
-    x_input = src.data.loc[ind_curr]
+    x_input = df_t.loc[ind_curr]
     yhat = yhat = src.lstm_predict(x_input)
 
     x_input.plot(style='b-')
-    src.data.loc[yhat.index].plot(style='g-')
+    df_t.loc[yhat.index].plot(style='g-')
     yhat.plot(style='r--')
     plt.pause(0.0001)
 
@@ -64,10 +64,10 @@ Harvest, Harvest_hat = start, start
 for today in pd.date_range(start,end):
     plt.cla()
     ind_curr = pd.date_range(today-timedelta(dhist-1),today)
-    x_input = src.data.loc[ind_curr]
+    x_input = df_t.loc[ind_curr]
     yhat = yhat = src.lstm_predict(x_input)
     ind_pred = yhat.index
-    yhat = lol.gdd(src.data.loc[pd.date_range(today-timedelta(365),today)].append(yhat))
+    yhat = lol.gdd(df_t.loc[pd.date_range(today-timedelta(365),today)].append(yhat))
 
     ind_curr_year = df_aGDD_s[df_aGDD_s.index. year == today.year].index
     Harvest = df_aGDD_s[ind_curr_year][df_aGDD_s[ind_curr_year] <= 500].index[-1].date()
