@@ -9,6 +9,9 @@ import lol
 
 from sklearn.preprocessing import StandardScaler
 
+import fbprophet
+from fbprophet import Prophet
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
@@ -17,18 +20,19 @@ from keras.layers import Dense
 from keras.layers import LSTM
 from math import sqrt
 
-# %%
 disp = False
 # base temperature : 5 celsius for timothy
 tbase = 5
 
 
-# %% #####
+# %%
 def sos(dft):
     # returns start of the season
     # dft = pandas timeseries
 
     mv_avg = [1,1,1]
+    #out=pd.Series()
+    #out = pd.DataFrame(columns=dft.columns)
     dft5C = (dft >= tbase) *1
 
     dft5C_conv = np.convolve(dft5C.loc[:], mv_avg,'same')
@@ -38,6 +42,18 @@ def sos(dft):
     if dft5C_conv.sum() > 0:
         out0 = np.where(np.diff(dft5C_conv) == 1 )[0][0]+2
     out = dft.index[out0]
+    #out.loc['sos'] = out0
+
+    #for k in dft.columns:
+    #    dft5C_conv = np.convolve(dft5C.loc[:,k], mv_avg,'same')
+    #    dft5C_conv = (dft5C_conv == sum(mv_avg)) * 1
+    #    dft5C_conv = (dft5C_conv.cumsum() >= 1) *1
+    #    out0 = 0
+    #    if dft5C_conv.sum() > 0:
+    #        out0 = np.where(np.diff(dft5C_conv) == 1 )[0][0]+2
+    #    out0 = dft.index[out0]
+    #    out.loc['sos',k] = out0
+        #print(k,out0)
     return out
 
 def gdd(ts):
@@ -55,7 +71,12 @@ def gdd(ts):
         outtmp.loc[:sos(outtmp)] = 0
         outtmp = outtmp.cumsum()
         out.loc[ind_yy] = outtmp
-    
+
+    #out.loc[:sos(out).loc['sos']] = 0
+    #for k in out.columns:
+    #    out.loc[:sos(out).loc['sos',k],k] = 0
+    #    out[k] = out[k].cumsum()
+
     return out
 
 def pad_ts(ts):
@@ -82,7 +103,7 @@ def pad_ts(ts):
     return out
 
 
-# %% #####
+# %%
 
 def split_sequence(sequence, n_steps_in, n_steps_out):
     X, y = list(), list()
@@ -109,9 +130,13 @@ class weather_station:
             self.lstm_data = self.prep_data_4lstm()
             self.lstm_scaler = self.lstm_data[4]
             self.lstm_model = self.build_model_4lstm()
-        #if 'prophet' in model_type: 
-        #if 'creme' in model_type: 
-        #if 'naive' in model_type: 
+        if 'prophet' in model_type:
+            self.ph_bestparameters = {'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 100}
+            self.ph_train = self.prep_data_4ph()
+            self.ph_model = self.build_model_4ph()
+
+        #if 'creme' in model_type: break
+        #if 'naive' in model_type: break
 
     def prep_data_4lstm(self):
         # to change later: historic period for training,
@@ -177,4 +202,43 @@ class weather_station:
         yhat = self.lstm_scaler.inverse_transform(yhat)
         yhat = pd.Series(yhat.flatten(),index=ind_horizon)
 
+        return yhat
+
+    def getparameters_4prophet(self):
+        all_params = [dict(zip(param_grid.keys(), v)) for v in itertools.product(*param_grid.values())]
+        rmses = []
+        # Use cross validation to evaluate all parameters
+        for params in all_params:
+            m = Prophet(**params,daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True, growth='linear')
+            m.add_seasonality(name='yearly', period=365.25, fourier_order=20)
+            m = m.fit(self.data)
+            df_cv = cross_validation(m, initial='730 days', period='365 days', horizon = '120 days')
+            df_p = performance_metrics(df_cv, rolling_window=1)
+            rmses.append(df_p['rmse'].values[0])
+        # Find the best parameters
+        tuning_results = pd.DataFrame(all_params)
+        tuning_results['rmse'] = rmses
+        if disp: print(tuning_results)
+        best_params = all_params[np.argmin(rmses)]
+        if disp: print(best_params)
+        self.ph_bestparameters = best_params
+        return best_params
+
+    def prep_data_4ph(self):
+        df_ph_train = pd.DataFrame(self.data , columns=['y'])
+        df_ph_train.reset_index(inplace=True)
+        df_ph_train = df_ph_train.rename({'index':'ds'},axis=1)
+        return df_ph_train
+
+    def build_model_4ph(self):
+        mprophet = Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=True, growth='linear',
+                     seasonality_prior_scale=self.ph_bestparameters ['seasonality_prior_scale'],changepoint_prior_scale=self.ph_bestparameters ['changepoint_prior_scale'])
+        mprophet.add_seasonality(name='yearly', period=365.25, fourier_order=20)
+        mprophet.fit(self.ph_train)
+        return mprophet
+
+    def ph_predict(self):
+        future = self.ph_model.make_future_dataframe(periods = self.dd_horizon)
+        forecast = self.ph_model.predict(future)
+        yhat = pd.Series(forecast['yhat'].values,index=forecast['ds'])
         return yhat
