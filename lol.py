@@ -146,13 +146,11 @@ class weather_station:
             self.ph_train = self.prep_data_4ph()
             self.ph_model = self.build_model_4ph()
 
-        #if 'creme' in model_type: break
-        #if 'naive' in model_type: break
+        #if 'creme' in model_type: 
+        #if 'naive' in model_type: 
 
     def prep_data_4lstm(self):
-        # to change later: historic period for training,
-        #   for now, for training set, it is year_train years of data since the first day in the weather station
-        #   for validation set, it is dhist + dhoriz after the training set
+        # validation set is dhist + dhoriz after the training set
 
         T = self.data.index
         Tselect = self.data.index[self.data.index.year<=self.data.index[0].year + self.year_train]
