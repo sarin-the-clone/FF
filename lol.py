@@ -5,7 +5,8 @@ import numpy as np
 from datetime import datetime, date, timedelta
 import pandas as pd
 import numpy as np
-import lol
+
+from boto3.dynamodb.conditions import Key
 
 from sklearn.preprocessing import StandardScaler
 
@@ -23,11 +24,22 @@ from keras.layers import Dense
 from keras.layers import LSTM
 from math import sqrt
 
+import calendar
+from river import compose
+from river import datasets
+from river import evaluate
+from river import linear_model
+from river import metrics
+from river import optim
+from river import preprocessing
+from river import time_series
+from river import neural_net as nn
+
 disp = False
 # base temperature : 5 celsius for timothy
 tbase = 5
 
-# %%
+# %% misc fun for temperature timeseries
 def sos(dft):
     # returns start of the season
     # dft = pandas timeseries
@@ -99,13 +111,58 @@ def pad_ts(ts):
         out.loc[yye] = out.iloc[-1]
 
     outi= out.resample('D')
-    out = outi.interpolate(methond='polynomial',order=3)
+    out = outi.interpolate(method='polynomial',order=3)
     #if out.shape[0] == 365:
     #    out = out.drop(out.index[-1])
     return out
 
 
-# %%
+def frost2ts(ws,table):
+    #queries dynamodb table and returns the timeseries for the weather station ws as a pd.series
+
+    fe = Key("SensorID").eq(ws)
+    response = table.query(KeyConditionExpression=fe)
+
+    out = []
+    out_year = []
+    out_day = []
+    for i in response["Items"]:
+        for ii in i.keys():
+            if (ii != "SensorID") and (ii != "Year") and (ii != "Unnamed: 0"):
+                out = np.append(out,float(i[ii]))
+                out_day = np.append(out_day,int(ii[4:]))
+                out_year = np.append(out_year,int(i["Year"]))
+
+    ts_out = pd.DataFrame(out)
+    ts_out['t']=list(zip(out_year,out_day))
+    ts_out.index = ts_out['t'].apply(lambda x: datetime.strptime(str(int(x[0]))+ "-" +str(int(x[1])), "%Y-%j"))#.strftime("%Y-%m-%d") )
+    ts_out.index.name = None
+    ts_out = ts_out.rename({0:'value'},axis=1)['value']
+    ts_out = pad_ts(ts_out).copy()
+    ts_out = pd.Series(ts_out)
+    return ts_out
+
+def get_harvest_date(ts,target_gdd):
+    ind_curryear = ts[ts.index.year == ts.index[-1].year].index
+    if (ts[ind_curryear] >= target_gdd).max():
+        HThatind = ts[ind_curryear][ts[ind_curryear] <= target_gdd].index[-1]
+    else :
+        HThatind = ts[ind_curryear].index[0]
+    #HThat = HThatind.date()
+    return HThatind
+
+# %% misc fun for river
+
+def get_ordinal_date(x):
+    return {'ordinal_date': x['day'].toordinal()}
+
+def get_month_distances(x):
+    return {
+        calendar.month_name[month]: math.exp(-(x['day'].month - month) ** 2)
+        for month in range(1, 13)
+    }
+
+# %% misc fun for data preparation
 
 def split_sequence(sequence, n_steps_in, n_steps_out):
     X, y = list(), list()
@@ -127,7 +184,13 @@ def stan_init(m):
         res[pname] = m.params[pname][0]
     return res
 
+def get_ordinal_date(x):
+    return {'ordinal_date': x['day'].toordinal()}
+
+#########################################################################################################
 # %%
+#########################################################################################################
+
 class weather_station:
     def __init__(self, df_t, dd_historic, dd_horizon, year_train, model_type):
         # df_t is a pd.Series
@@ -136,27 +199,38 @@ class weather_station:
         self.dd_historic, self.dd_horizon, self.year_train = dd_historic, dd_horizon, year_train
 
         if type(model_type) == str: model_type = (model_type)
+
         if 'lstm' in model_type:
             self.n_features = 1
-            self.lstm_data = self.prep_data_4lstm()
+            self.lstm_data = self.prep_data_4lstm() # = Xtrain, Ytrain, Xval, Yval, scaler
             self.lstm_scaler = self.lstm_data[4]
             self.lstm_model = self.build_model_4lstm()
+
         if 'prophet' in model_type:
             self.ph_bestparameters = {'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 100}
             self.ph_train = self.prep_data_4ph()
             self.ph_model = self.build_model_4ph()
 
-        #if 'creme' in model_type: 
-        #if 'naive' in model_type: 
+        if 'snarimax' in model_type:
+            #p=365,d=0,q=90, m=365, sp=90,sd=0, sq=90,
+            self.snarimax_para = [365, 0, 90, 365, 90, 0, 90]
+            self.snarimax_data = self.prep_data_4snarimax()
+            self.snarimax_model, self.snarimax_metric = self.build_model_4snarimax()
 
-    def prep_data_4lstm(self):
-        # validation set is dhist + dhoriz after the training set
+        #if 'naive' in model_type:
+
+
+### lstm seq2seq ###
+    def prep_data_4lstm(self): #return Xtrain, Ytrain, Xval, Yval, scaler
 
         T = self.data.index
-        Tselect = self.data.index[self.data.index.year<=self.data.index[0].year + self.year_train]
+        #Ttrain = T[0:self.year_train*365]
+        #Tval = T[self.year_train*365:]
+        Ttrain = T[0:-self.dd_historic]
+        Tval = T[self.dd_horizon:]
 
-        train = self.data.loc[Tselect]
-        validate = self.data[(self.data.index > Tselect[-1]) & (self.data.index <= Tselect[-1] + timedelta(self.dd_historic + self.dd_horizon) )]
+        train = self.data.loc[Ttrain]
+        validate = self.data[Tval]
         #train.shape, validate.shape
 
         scaler = StandardScaler()
@@ -173,7 +247,7 @@ class weather_station:
 
         return Xtrain, Ytrain, Xval, Yval, scaler
 
-    def build_model_4lstm(self):
+    def build_model_4lstm(self): #return model_out
         n_neurons = 100
         n_epochs, n_batch_size = 25, 32
         Xtrain, Ytrain, Xval, Yval, sc = self.lstm_data
@@ -196,9 +270,23 @@ class weather_station:
 
         return model_out
 
-    def lstm_predict(self,x_input):
-        # x_input = pd.Series of length dd_historic
+    def lstm_learn_new(self, X, Y): #does not work
+        n_epochs, n_batch_size = 25, 32
 
+        X = X.values.reshape(-1,1)
+        X = self.lstm_scaler.transform(X)
+        X = X.reshape(1, self.dd_historic, self.n_features)
+
+        Y = Y.values.reshape(-1,1)
+        Y = self.lstm_scaler.transform(Y)
+        Y = Y.reshape(1, self.dd_historic, self.n_features)
+
+        reduce_lr = tf.keras.callbacks.LearningRateScheduler(lambda x: 1e-3 * 0.90 ** x)
+        self.lstm_model.fit(X,Y,epochs=n_epochs,batch_size=n_batch_size,verbose=0,callbacks=[reduce_lr])
+
+    def lstm_predict(self,x_input): #return yhat
+        # x_input = pd.Series of length dd_historic
+        #x_input = self.data[-self.dd_historic:]
         dd_last = x_input.index[-1]
 
         x_input = x_input.values.reshape(-1,1)
@@ -213,7 +301,8 @@ class weather_station:
 
         return yhat
 
-    def getparameters_4prophet(self):
+### FB prophet ###
+    def getparameters_4ph(self): #return best_params and overide default parameters
         all_params = [dict(zip(param_grid.keys(), v)) for v in itertools.product(*param_grid.values())]
         rmses = []
         # Use cross validation to evaluate all parameters
@@ -233,21 +322,88 @@ class weather_station:
         self.ph_bestparameters = best_params
         return best_params
 
-    def prep_data_4ph(self):
-        df_ph_train = pd.DataFrame(self.data , columns=['y'])
-        df_ph_train.reset_index(inplace=True)
-        df_ph_train = df_ph_train.rename({'index':'ds'},axis=1)
+    def prep_data_4ph(self): #return df_ph_train
+        df_ph_train = pd.DataFrame(self.data.values , columns=['y'])
+        #df_ph_train.reset_index(inplace=True)
+        #df_ph_train = df_ph_train.rename({'index':'ds'},axis=1)
+        df_ph_train['ds'] = self.data.index
         return df_ph_train
 
-    def build_model_4ph(self):
+    def build_model_4ph(self): #return mprophet
         mprophet = Prophet(daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=True, growth='linear',
                      seasonality_prior_scale=self.ph_bestparameters ['seasonality_prior_scale'],changepoint_prior_scale=self.ph_bestparameters ['changepoint_prior_scale'])
-        mprophet.add_seasonality(name='yearly', period=365.25, fourier_order=20)
+        #mprophet.add_seasonality(name='yearly', period=365.25, fourier_order=20)
         mprophet.fit(self.ph_train)
         return mprophet
 
-    def ph_predict(self):
+    def ph_predict(self): #return yhat
         future = self.ph_model.make_future_dataframe(periods = self.dd_horizon)
         forecast = self.ph_model.predict(future)
         yhat = pd.Series(forecast['yhat'].values,index=forecast['ds'])
+        yhat.loc[self.data.index] = self.data
         return yhat
+
+### River SNARIMAX ###
+    #### Important:
+    ####    This implementation does not use the reatime modelling feature of river
+    ####    because the model is not saved. Here, the model is rebuilt at each call.
+    ####    To use the realtime, find a way to save the model somewhere and load it when needed.
+    ####    If an old model is loaded from a save, there is no need to rebuild the model from scratch with "build_model_4snarimax()""
+    ####    The model will be updated by "snarimax_predict()", thus it needs to be saved after calling "snarimax_predict()"
+
+    def prep_data_4snarimax(self): #converts into river dataset format
+        dataset = pd.DataFrame(self.data.values, columns=['temp'])
+        dataset['ds']= self.data.index
+        dataset.index = dataset['ds']
+        dataset['ds_ordinal']= dataset['ds'].apply(lambda x:{'ordinal_date': x.toordinal()})
+        dataset['ds']= dataset['ds'].apply(lambda x:{'day':x})
+        return dataset
+
+    def build_model_4snarimax(self):
+        p, d, q, m, sp, sd, sq = self.snarimax_para
+        extract_features = compose.TransformerUnion(get_ordinal_date)
+        model = (
+                extract_features |
+                time_series.SNARIMAX(
+                    p=p,d=d,q=q, m=m, sp=sp,sd=sd, sq=sq,
+                    regressor=(
+                        preprocessing.StandardScaler() |
+                        linear_model.LinearRegression(
+                            intercept_init=0,
+                            optimizer=optim.SGD(0.0001), #important parameter
+                            intercept_lr=0.01
+                            )
+                        )
+                    )
+                )
+        metric = metrics.Rolling(metrics.MAE(), 120)
+
+        start1 = self.data.index[0]
+        start2 = self.data.index[-1]
+
+        for t in pd.date_range(start1,start2):
+            x, y = self.snarimax_data.loc[t][['ds','temp']].values
+            y_pred = model.forecast(horizon=1, xs=[x])
+            model = model.learn_one(x, y)
+            metric = metric.update(y, y_pred[0])
+        return model, metric
+
+    def snarimax_predict(self):
+        t = self.data.index[-1]
+        horizon = pd.date_range(t+timedelta(1),periods=self.dd_horizon,freq='D')
+
+        #x, y = self.snarimax_data.loc[t][['ds','temp']].values
+        #y_pred = self.snarimax_model.forecast(horizon=1, xs=[x])
+        #self.snarimax_model = self.snarimax_model.learn_one(x, y)
+        #self.snarimax_metric = self.snarimax_metric.update(y, y_pred[0])
+
+        future = [ {'day': t + timedelta(dd)}
+                    for dd in range(1, self.dd_horizon + 1) ]
+
+        forecast = self.snarimax_model.forecast(horizon=self.dd_horizon, xs=future)
+
+        yhat = pd.Series(forecast,index=horizon)
+        yhat = self.data.append(yhat)
+
+        return yhat
+
