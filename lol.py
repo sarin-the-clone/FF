@@ -1,4 +1,7 @@
 
+import pickle
+import os
+
 from datetime import datetime, date, timedelta
 import pandas as pd
 import numpy as np
@@ -9,6 +12,7 @@ import numpy as np
 from boto3.dynamodb.conditions import Key
 
 from sklearn.preprocessing import StandardScaler
+from scipy.signal import savgol_filter
 
 import fbprophet
 from fbprophet import Prophet
@@ -192,11 +196,14 @@ def get_ordinal_date(x):
 #########################################################################################################
 
 class weather_station:
-    def __init__(self, df_t, dd_historic, dd_horizon, year_train, model_type):
+    def __init__(self,ws_name, df_t, dd_historic, dd_horizon, year_train, model_type):
         # df_t is a pd.Series
-
+        self.ws_name = ws_name
         self.data = df_t
         self.dd_historic, self.dd_horizon, self.year_train = dd_historic, dd_horizon, year_train
+
+        if not os.path.exists('./models_bck/'): os.makedirs('./models_bck/')
+        self.pck_filename = './models_bck/' + str(ws_name)+'_snarimax.pickle'
 
         if type(model_type) == str: model_type = (model_type)
 
@@ -211,11 +218,19 @@ class weather_station:
             self.ph_train = self.prep_data_4ph()
             self.ph_model = self.build_model_4ph()
 
-        if 'snarimax' in model_type:
+        if 'snarimax' in model_type: #for unknown reasons, I'am not able to get good predictions as I used to.
             #p=365,d=0,q=90, m=365, sp=90,sd=0, sq=90,
-            self.snarimax_para = [365, 0, 90, 365, 90, 0, 90]
+            #p : Order of the autoregressive part, number of past target values that will be included as features. (horizon for Xt)
+            #d : Differencing order.
+            #q : Order of the moving average part, number of past error terms that will be included as features. (horizon for epsilon)
+            #m : Season length used for extracting seasonal features.
+            #sp: Seasonal order, number of past target values that will be included as features.
+            #sd: Seasonal differencing order
+            #sq: Seasonal order of the moving average, number of past error terms that will be included as features.
+            #self.snarimax_para = [365, 0, 7, 365, 180, 0, 180]
+            self.snarimax_para = [540, 0, 365, 365, 180, 0, 365]
             self.snarimax_data = self.prep_data_4snarimax()
-            self.snarimax_model, self.snarimax_metric = self.build_model_4snarimax()
+            self.build_model_4snarimax()
 
         #if 'naive' in model_type:
 
@@ -344,58 +359,81 @@ class weather_station:
         return yhat
 
 ### River SNARIMAX ###
-    #### Important:
-    ####    This implementation does not use the reatime modelling feature of river
-    ####    because the model is not saved. Here, the model is rebuilt at each call.
-    ####    To use the realtime, find a way to save the model somewhere and load it when needed.
-    ####    If an old model is loaded from a save, there is no need to rebuild the model from scratch with "build_model_4snarimax()""
-    ####    The model will be updated by "snarimax_predict()", thus it needs to be saved after calling "snarimax_predict()"
 
     def prep_data_4snarimax(self): #converts into river dataset format
-        dataset = pd.DataFrame(self.data.values, columns=['temp'])
+        svg_data = self.data.values #savgol_filter(self.data, 29, 3, mode='nearest')
+        dataset = pd.DataFrame(svg_data, columns=['temp'])
         dataset['ds']= self.data.index
         dataset.index = dataset['ds']
         dataset['ds_ordinal']= dataset['ds'].apply(lambda x:{'ordinal_date': x.toordinal()})
         dataset['ds']= dataset['ds'].apply(lambda x:{'day':x})
-        return dataset
+        return dataset #saved in self.snarimax_data
 
     def build_model_4snarimax(self):
-        p, d, q, m, sp, sd, sq = self.snarimax_para
-        extract_features = compose.TransformerUnion(get_ordinal_date)
-        model = (
-                extract_features |
-                time_series.SNARIMAX(
-                    p=p,d=d,q=q, m=m, sp=sp,sd=sd, sq=sq,
-                    regressor=(
-                        preprocessing.StandardScaler() |
-                        linear_model.LinearRegression(
-                            intercept_init=0,
-                            optimizer=optim.SGD(0.0001), #important parameter
-                            intercept_lr=0.01
+        if os.path.exists(self.pck_filename): #if model backup exists then load it and update model from start1 to start2
+            src_bck = pickle.load(open(self.pck_filename,'rb'))
+            model = src_bck.snarimax_model
+            metric = src_bck.snarimax_metric
+            self.snarimax_para = src_bck.snarimax_para
+            self.snarimax_model = model
+            self.snarimax_metric = metric
+
+            start1 = src_bck.data.index[-1]
+            start2 = self.data.index[-1]
+
+        else: #if model backup does not exist then rebuild model from the start
+            p, d, q, m, sp, sd, sq = self.snarimax_para
+            extract_features = compose.TransformerUnion(get_ordinal_date)
+            model = (
+                    extract_features |
+                    time_series.SNARIMAX(
+                        p=p, d=d, q=q, m=m, sp=sp, sd=sd, sq=sq,
+                        regressor=(
+                            preprocessing.StandardScaler() |
+                            #linear_model.PARegressor(
+                            #    C=0.1,
+                            #    mode=1,
+                            #    eps=0.0001,
+                            #    learn_intercept=True
+                            #    )
+                            linear_model.LinearRegression(
+                                #intercept_init=0,
+                                optimizer=optim.SGD(0.0001), #important parameter
+                                #optimizer=optim.AdaDelta(0.8,0.00001), #important parameter
+                                #optimizer=optim.AMSGrad(lr=0.001,beta_1=0.1,beta_2=0.999),
+                                #intercept_lr=0.1
+                                )
                             )
                         )
                     )
-                )
-        metric = metrics.Rolling(metrics.MAE(), 120)
+            metric = metrics.Rolling(metrics.MAE(), 365)
 
-        start1 = self.data.index[0]
-        start2 = self.data.index[-1]
+            start1 = self.data.index[0]
+            start2 = self.data.index[-1]
 
-        for t in pd.date_range(start1,start2):
-            x, y = self.snarimax_data.loc[t][['ds','temp']].values
-            y_pred = model.forecast(horizon=1, xs=[x])
-            model = model.learn_one(x, y)
-            metric = metric.update(y, y_pred[0])
-        return model, metric
+        if start1 != start2:
+            for t in pd.date_range(start1,start2):
+                x, y = self.snarimax_data.loc[t][['ds','temp']].values
+                y_pred = model.forecast(horizon=1, xs=[x])
+                model = model.learn_one(x, y)
+                metric = metric.update(y, y_pred[0])
+
+
+            self.snarimax_model = model
+            self.snarimax_metric = metric
+            with open(self.pck_filename, 'wb') as fh: pickle.dump(self,fh)
+
+        return
 
     def snarimax_predict(self):
         t = self.data.index[-1]
         horizon = pd.date_range(t+timedelta(1),periods=self.dd_horizon,freq='D')
 
-        #x, y = self.snarimax_data.loc[t][['ds','temp']].values
-        #y_pred = self.snarimax_model.forecast(horizon=1, xs=[x])
-        #self.snarimax_model = self.snarimax_model.learn_one(x, y)
-        #self.snarimax_metric = self.snarimax_metric.update(y, y_pred[0])
+        x, y = self.snarimax_data.loc[t][['ds','temp']].values
+        y_pred = self.snarimax_model.forecast(horizon=1, xs=[x])
+        self.snarimax_model = self.snarimax_model.learn_one(x, y)
+        self.snarimax_metric = self.snarimax_metric.update(y, y_pred[0])
+        with open(self.pck_filename, 'wb') as fh: pickle.dump(self,fh)
 
         future = [ {'day': t + timedelta(dd)}
                     for dd in range(1, self.dd_horizon + 1) ]
@@ -404,6 +442,7 @@ class weather_station:
 
         yhat = pd.Series(forecast,index=horizon)
         yhat = self.data.append(yhat)
+        #print('predicting ', t.date())
 
         return yhat
 
