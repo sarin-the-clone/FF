@@ -38,6 +38,8 @@ from river import optim
 from river import preprocessing
 from river import time_series
 from river import neural_net as nn
+from river import reco
+from river import linear_model as lm
 
 disp = False
 # base temperature : 5 celsius for timothy
@@ -218,7 +220,7 @@ class weather_station:
             self.ph_train = self.prep_data_4ph()
             self.ph_model = self.build_model_4ph()
 
-        if 'snarimax' in model_type: #for unknown reasons, I'am not able to get good predictions as I used to.
+        if 'snarimax' in model_type:
             #p=365,d=0,q=90, m=365, sp=90,sd=0, sq=90,
             #p : Order of the autoregressive part, number of past target values that will be included as features. (horizon for Xt)
             #d : Differencing order.
@@ -227,8 +229,10 @@ class weather_station:
             #sp: Seasonal order, number of past target values that will be included as features.
             #sd: Seasonal differencing order
             #sq: Seasonal order of the moving average, number of past error terms that will be included as features.
-            #self.snarimax_para = [365, 0, 7, 365, 180, 0, 180]
-            self.snarimax_para = [540, 0, 365, 365, 180, 0, 365]
+            #self.snarimax_para = [365, 0, 90, 365, 90, 0, 90]
+            self.snarimax_para = [0, 0, 730, 365, 0, 0, 730]
+            #self.snarimax_para = [730, 0, 90, 365, 90, 0, 365]
+            #self.snarimax_para = [0, 0, 365, 365, 90, 0, 365]
             self.snarimax_data = self.prep_data_4snarimax()
             self.build_model_4snarimax()
 
@@ -361,7 +365,9 @@ class weather_station:
 ### River SNARIMAX ###
 
     def prep_data_4snarimax(self): #converts into river dataset format
-        svg_data = self.data.values #savgol_filter(self.data, 29, 3, mode='nearest')
+        #self.data = self.data.loc[self.data.index[:-self.data.index[-1].weekday()]].copy()
+        svg_data = self.data.values
+        #svg_data = savgol_filter(self.data, 7, 1, mode='nearest')
         dataset = pd.DataFrame(svg_data, columns=['temp'])
         dataset['ds']= self.data.index
         dataset.index = dataset['ds']
@@ -379,42 +385,46 @@ class weather_station:
             self.snarimax_metric = metric
 
             start1 = src_bck.data.index[-1]
-            start2 = self.data.index[-1]
+            start2 = self.data.index[-1]#self.data.index[-self.data.index[-1].weekday()]
 
         else: #if model backup does not exist then rebuild model from the start
             p, d, q, m, sp, sd, sq = self.snarimax_para
             extract_features = compose.TransformerUnion(get_ordinal_date)
             model = (
                     extract_features |
+
                     time_series.SNARIMAX(
                         p=p, d=d, q=q, m=m, sp=sp, sd=sd, sq=sq,
                         regressor=(
+                            #preprocessing.Normalizer() |
+                            preprocessing.AdaptiveStandardScaler(alpha=0.1)|
                             preprocessing.StandardScaler() |
-                            #linear_model.PARegressor(
-                            #    C=0.1,
-                            #    mode=1,
-                            #    eps=0.0001,
-                            #    learn_intercept=True
-                            #    )
+
+                            #preprocessing.RobustScaler(with_scaling=True) |
                             linear_model.LinearRegression(
-                                #intercept_init=0,
+                                intercept_init=0,
                                 optimizer=optim.SGD(0.0001), #important parameter
                                 #optimizer=optim.AdaDelta(0.8,0.00001), #important parameter
-                                #optimizer=optim.AMSGrad(lr=0.001,beta_1=0.1,beta_2=0.999),
-                                #intercept_lr=0.1
+                                #optimizer=optim.AMSGrad(lr=0.01,beta_1=0.8,beta_2=0.1),
+                                intercept_lr=0.001
                                 )
                             )
                         )
                     )
-            metric = metrics.Rolling(metrics.MAE(), 365)
+
+
+
+            metric = metrics.Rolling(metrics.MSE(), self.dd_historic)
+            #metric = metrics.MSE()
 
             start1 = self.data.index[0]
-            start2 = self.data.index[-1]
+            start2 = self.data.index[-1]#self.data.index[-self.data.index[-1].weekday()]
 
-        if start1 != start2:
-            for t in pd.date_range(start1,start2):
+        if start1 < start2:
+            for t in pd.date_range(start1,start2,freq='D'):
                 x, y = self.snarimax_data.loc[t][['ds','temp']].values
                 y_pred = model.forecast(horizon=1, xs=[x])
+                #print(x,y,y_pred[0],y-y_pred[0])
                 model = model.learn_one(x, y)
                 metric = metric.update(y, y_pred[0])
 
@@ -422,6 +432,19 @@ class weather_station:
             self.snarimax_model = model
             self.snarimax_metric = metric
             with open(self.pck_filename, 'wb') as fh: pickle.dump(self,fh)
+
+            #for t in pd.date_range(start1, start2):
+            #    x = self.snarimax_data.loc[pd.date_range(t-timedelta(self.dd_historic),t)][['ds']].values
+            #    y = self.snarimax_data.loc[pd.date_range(t-timedelta(self.dd_historic),t)][['temp']].values
+            #    x = np.hstack(x)
+            #    y = np.hstack(y)
+            #    y_pred = model.forecast(horizon=self.dd_historic+1, xs=x)
+            #    for i in range(0,self.dd_historic):
+            #        model = model.learn_one(x[i], y[i])
+            #        metric = metric.update(y[i], y_pred[i])
+
+
+
 
         return
 
@@ -431,9 +454,12 @@ class weather_station:
 
         x, y = self.snarimax_data.loc[t][['ds','temp']].values
         y_pred = self.snarimax_model.forecast(horizon=1, xs=[x])
-        self.snarimax_model = self.snarimax_model.learn_one(x, y)
-        self.snarimax_metric = self.snarimax_metric.update(y, y_pred[0])
-        with open(self.pck_filename, 'wb') as fh: pickle.dump(self,fh)
+
+        if True: #t.weekday()==1:
+            self.snarimax_model = self.snarimax_model.learn_one(x, y)
+            self.snarimax_metric = self.snarimax_metric.update(y, y_pred[0])
+
+            with open(self.pck_filename, 'wb') as fh: pickle.dump(self,fh)
 
         future = [ {'day': t + timedelta(dd)}
                     for dd in range(1, self.dd_horizon + 1) ]
@@ -442,7 +468,7 @@ class weather_station:
 
         yhat = pd.Series(forecast,index=horizon)
         yhat = self.data.append(yhat)
+
         #print('predicting ', t.date())
 
         return yhat
-
