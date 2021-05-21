@@ -41,7 +41,7 @@ from river import neural_net as nn
 from river import reco
 from river import linear_model as lm
 
-disp = False
+disp = True
 # base temperature : 5 celsius for timothy
 tbase = 5
 
@@ -216,7 +216,7 @@ class weather_station:
             self.lstm_model = self.build_model_4lstm()
 
         if 'prophet' in model_type:
-            self.ph_bestparameters = {'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 100}
+            self.ph_bestparameters = {'changepoint_prior_scale': 0.01, 'seasonality_prior_scale': 3}
             self.ph_train = self.prep_data_4ph()
             self.ph_model = self.build_model_4ph()
 
@@ -245,8 +245,8 @@ class weather_station:
         T = self.data.index
         #Ttrain = T[0:self.year_train*365]
         #Tval = T[self.year_train*365:]
-        Ttrain = T[0:-self.dd_historic]
-        Tval = T[self.dd_horizon:]
+        Ttrain = T[0:-self.dd_historic-self.dd_horizon]
+        Tval = T[-self.dd_historic-self.dd_horizon:]
 
         train = self.data.loc[Ttrain]
         validate = self.data[Tval]
@@ -322,14 +322,17 @@ class weather_station:
 
 ### FB prophet ###
     def getparameters_4ph(self): #return best_params and overide default parameters
+        param_grid = { 'changepoint_prior_scale': [0.001, 0.01, 0.1, 0.3, 0.5, 1],
+                       'seasonality_prior_scale': [0.01, 0.1, 1, 3, 6, 10, 20],
+                       }
         all_params = [dict(zip(param_grid.keys(), v)) for v in itertools.product(*param_grid.values())]
         rmses = []
         # Use cross validation to evaluate all parameters
         for params in all_params:
             m = Prophet(**params,daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True, growth='linear')
             m.add_seasonality(name='yearly', period=365.25, fourier_order=20)
-            m = m.fit(self.data)
-            df_cv = cross_validation(m, initial='730 days', period='365 days', horizon = '120 days')
+            m = m.fit(self.ph_train)
+            df_cv = cross_validation(m, initial='730 days', period='90 days', horizon = '180 days')
             df_p = performance_metrics(df_cv, rolling_window=1)
             rmses.append(df_p['rmse'].values[0])
         # Find the best parameters
